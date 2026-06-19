@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef, useMemo } from "react";
 import {
   Board,
   Card,
@@ -8,8 +8,15 @@ import {
   PEOPLE,
   PERSON_COLORS,
   Tag,
+  contrastText,
 } from "./types";
-import { loadBoard, saveBoard, uid, defaultBoard } from "./storage";
+import {
+  fetchBoard,
+  persistBoard,
+  uid,
+  defaultBoard,
+  getBackend,
+} from "./storage";
 import CardEditor from "./CardEditor";
 
 type DragInfo = { cardId: string; fromColumn: string } | null;
@@ -22,18 +29,40 @@ export default function Home() {
   const [drag, setDrag] = useState<DragInfo>(null);
   const [dragOverCol, setDragOverCol] = useState<string | null>(null);
   const [filterPerson, setFilterPerson] = useState<Person | "All">("All");
+  const [search, setSearch] = useState("");
+  const [synced, setSynced] = useState<"cloud" | "local">("local");
+  const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const loaded = useRef(false);
 
   useEffect(() => {
-    setBoard(loadBoard());
+    fetchBoard().then((b) => {
+      setBoard(b);
+      setSynced(getBackend() === "kv" ? "cloud" : "local");
+      loaded.current = true;
+    });
   }, []);
 
+  // Debounced persistence so dragging / typing doesn't spam the backend.
   useEffect(() => {
-    if (board) saveBoard(board);
+    if (!board || !loaded.current) return;
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(() => {
+      persistBoard(board);
+    }, 500);
+    return () => {
+      if (saveTimer.current) clearTimeout(saveTimer.current);
+    };
   }, [board]);
 
   const update = useCallback((fn: (b: Board) => Board) => {
     setBoard((prev) => (prev ? fn(structuredClone(prev)) : prev));
   }, []);
+
+  const overdueCount = useMemo(() => {
+    if (!board) return 0;
+    return Object.values(board.cards).filter((c) => isOverdue(c.deadline))
+      .length;
+  }, [board]);
 
   if (!board) {
     return <div className="loading">Loading board…</div>;
@@ -80,6 +109,35 @@ export default function Home() {
     setEditing(null);
   }
 
+  function moveCard(cardId: string, fromCol: string, dir: -1 | 1) {
+    update((b) => {
+      const idx = b.columns.findIndex((c) => c.id === fromCol);
+      const target = b.columns[idx + dir];
+      if (!target) return b;
+      b.columns[idx].cardIds = b.columns[idx].cardIds.filter(
+        (id) => id !== cardId
+      );
+      target.cardIds.unshift(cardId);
+      return b;
+    });
+  }
+
+  function sortColumnByDeadline(columnId: string) {
+    update((b) => {
+      const col = b.columns.find((c) => c.id === columnId);
+      if (!col) return b;
+      col.cardIds.sort((a, c) => {
+        const da = b.cards[a]?.deadline;
+        const dc = b.cards[c]?.deadline;
+        if (!da && !dc) return 0;
+        if (!da) return 1;
+        if (!dc) return -1;
+        return da.localeCompare(dc);
+      });
+      return b;
+    });
+  }
+
   function addColumn() {
     const title = prompt("Column name?", "New Column");
     if (!title) return;
@@ -124,7 +182,6 @@ export default function Home() {
   function setTags(tags: Tag[]) {
     update((b) => {
       b.tags = tags;
-      // strip removed tag ids from cards
       const valid = new Set(tags.map((t) => t.id));
       Object.values(b.cards).forEach((card) => {
         card.tagIds = card.tagIds.filter((id) => valid.has(id));
@@ -135,27 +192,35 @@ export default function Home() {
 
   function resetBoard() {
     if (confirm("Reset the board to its default state? This clears all tasks.")) {
-      setBoard(defaultBoard());
+      const b = defaultBoard();
+      setBoard(b);
+      persistBoard(b);
     }
   }
 
-  function isOverdue(deadline: string | null) {
-    if (!deadline) return false;
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    return new Date(deadline + "T00:00:00") < today;
-  }
+  const q = search.trim().toLowerCase();
 
   return (
     <main>
       <header className="topbar">
         <div className="brand">
-          <span className="logo">▦</span>
-          <h1>Taskboard</h1>
+          <span className="logo">◼</span>
+          <h1>TASKBOARD</h1>
+          <span className={synced === "cloud" ? "sync cloud" : "sync local"}>
+            {synced === "cloud" ? "● synced" : "○ local"}
+          </span>
+          {overdueCount > 0 && (
+            <span className="overdue-badge">{overdueCount} overdue</span>
+          )}
         </div>
         <div className="toolbar">
+          <input
+            className="search"
+            placeholder="Search tasks…"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+          />
           <div className="filter">
-            <span>Filter:</span>
             <button
               className={filterPerson === "All" ? "chip active" : "chip"}
               onClick={() => setFilterPerson("All")}
@@ -166,12 +231,9 @@ export default function Home() {
               <button
                 key={p}
                 className={filterPerson === p ? "chip active" : "chip"}
-                style={
-                  filterPerson === p
-                    ? { background: PERSON_COLORS[p], borderColor: PERSON_COLORS[p] }
-                    : { borderColor: PERSON_COLORS[p], color: PERSON_COLORS[p] }
+                onClick={() =>
+                  setFilterPerson((cur) => (cur === p ? "All" : p))
                 }
-                onClick={() => setFilterPerson(p)}
               >
                 {p}
               </button>
@@ -187,25 +249,31 @@ export default function Home() {
       </header>
 
       <div className="board">
-        {board.columns.map((col) => {
+        {board.columns.map((col, colIndex) => {
           const visibleCards = col.cardIds
             .map((id) => board.cards[id])
             .filter(Boolean)
             .filter(
               (c) =>
                 filterPerson === "All" || c.assignees.includes(filterPerson)
+            )
+            .filter(
+              (c) =>
+                !q ||
+                c.title.toLowerCase().includes(q) ||
+                c.description.toLowerCase().includes(q)
             );
           return (
             <section
               key={col.id}
-              className={
-                dragOverCol === col.id ? "column drag-over" : "column"
-              }
+              className={dragOverCol === col.id ? "column drag-over" : "column"}
               onDragOver={(e) => {
                 e.preventDefault();
                 setDragOverCol(col.id);
               }}
-              onDragLeave={() => setDragOverCol((c) => (c === col.id ? null : c))}
+              onDragLeave={() =>
+                setDragOverCol((c) => (c === col.id ? null : c))
+              }
               onDrop={() => onDrop(col.id)}
             >
               <div className="column-head">
@@ -214,6 +282,12 @@ export default function Home() {
                   <span className="count">{visibleCards.length}</span>
                 </h2>
                 <div className="column-actions">
+                  <button
+                    title="Sort by deadline"
+                    onClick={() => sortColumnByDeadline(col.id)}
+                  >
+                    ⇅
+                  </button>
                   <button title="Add card" onClick={() => addCard(col.id)}>
                     +
                   </button>
@@ -227,6 +301,9 @@ export default function Home() {
               </div>
 
               <div className="cards">
+                {visibleCards.length === 0 && (
+                  <div className="empty-hint">Drop tasks here</div>
+                )}
                 {visibleCards.map((card) => (
                   <article
                     key={card.id}
@@ -250,7 +327,10 @@ export default function Home() {
                             <span
                               key={tid}
                               className="tag"
-                              style={{ background: tag.color }}
+                              style={{
+                                background: tag.color,
+                                color: contrastText(tag.color),
+                              }}
                             >
                               {tag.label}
                             </span>
@@ -269,7 +349,10 @@ export default function Home() {
                             key={p}
                             className="avatar"
                             title={p}
-                            style={{ background: PERSON_COLORS[p] }}
+                            style={{
+                              background: PERSON_COLORS[p],
+                              color: contrastText(PERSON_COLORS[p]),
+                            }}
                           >
                             {p[0]}
                           </span>
@@ -283,16 +366,35 @@ export default function Home() {
                               : "deadline"
                           }
                         >
-                          ⏰ {formatDate(card.deadline)}
+                          {formatDate(card.deadline)}
                         </span>
                       )}
                     </div>
+                    <div className="card-move">
+                      <button
+                        title="Move left"
+                        disabled={colIndex === 0}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          moveCard(card.id, col.id, -1);
+                        }}
+                      >
+                        ◀
+                      </button>
+                      <button
+                        title="Move right"
+                        disabled={colIndex === board.columns.length - 1}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          moveCard(card.id, col.id, 1);
+                        }}
+                      >
+                        ▶
+                      </button>
+                    </div>
                   </article>
                 ))}
-                <button
-                  className="add-card"
-                  onClick={() => addCard(col.id)}
-                >
+                <button className="add-card" onClick={() => addCard(col.id)}>
                   + Add a card
                 </button>
               </div>
@@ -313,6 +415,13 @@ export default function Home() {
       )}
     </main>
   );
+}
+
+function isOverdue(deadline: string | null) {
+  if (!deadline) return false;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  return new Date(deadline + "T00:00:00") < today;
 }
 
 function formatDate(iso: string) {

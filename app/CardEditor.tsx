@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import {
   Card,
   Person,
@@ -8,6 +8,7 @@ import {
   PERSON_COLORS,
   Tag,
   TAG_PALETTE,
+  contrastText,
 } from "./types";
 import { uid } from "./storage";
 
@@ -28,7 +29,17 @@ export default function CardEditor({
 }) {
   const [draft, setDraft] = useState<Card>({ ...card });
   const [newTagLabel, setNewTagLabel] = useState("");
-  const [newTagColor, setNewTagColor] = useState(TAG_PALETTE[5]);
+  const [newTagColor, setNewTagColor] = useState(TAG_PALETTE[2]);
+
+  // Esc closes, Cmd/Ctrl+Enter saves.
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") onClose();
+      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") onSave(draft);
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [draft, onClose, onSave]);
 
   function toggleAssignee(p: Person) {
     setDraft((d) => ({
@@ -98,12 +109,22 @@ export default function CardEditor({
                 className={on ? "person on" : "person"}
                 style={
                   on
-                    ? { background: PERSON_COLORS[p], borderColor: PERSON_COLORS[p] }
-                    : { borderColor: PERSON_COLORS[p], color: PERSON_COLORS[p] }
+                    ? {
+                        background: PERSON_COLORS[p],
+                        borderColor: PERSON_COLORS[p],
+                        color: contrastText(PERSON_COLORS[p]),
+                      }
+                    : { borderColor: "#555", color: "#e8e8e8" }
                 }
                 onClick={() => toggleAssignee(p)}
               >
-                <span className="avatar sm" style={{ background: on ? "rgba(255,255,255,.3)" : PERSON_COLORS[p] }}>
+                <span
+                  className="avatar sm"
+                  style={{
+                    background: PERSON_COLORS[p],
+                    color: contrastText(PERSON_COLORS[p]),
+                  }}
+                >
                   {p[0]}
                 </span>
                 {p}
@@ -142,7 +163,7 @@ export default function CardEditor({
                   style={{
                     background: on ? t.color : "transparent",
                     borderColor: t.color,
-                    color: on ? "#fff" : t.color,
+                    color: on ? contrastText(t.color) : "#e8e8e8",
                   }}
                   onClick={() => toggleTag(t.id)}
                 >
@@ -192,6 +213,7 @@ export default function CardEditor({
             Delete
           </button>
           <div className="spacer" />
+          <span className="hint">⌘↵ save · esc close</span>
           <button className="btn ghost" onClick={onClose}>
             Cancel
           </button>
